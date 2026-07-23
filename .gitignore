@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# training outputs / weights
+runs/
+outputs/
+*.pt
+*.onnx
+*.engine
+
+# logs
+train_log.txt
+*.log
+
+# IDE
+.idea/
+.claude/

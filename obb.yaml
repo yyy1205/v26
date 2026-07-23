@@ -1,0 +1,11 @@
+# YOLOv8 OBB 数据集配置  # 数据集根目录
+path:  D:\ultralytics-8.1.41\ultralytics\models\yolo\obb\datasets\data17\data17 # dataset root dir
+train: images/train  # 训练图片文件夹（相对path）
+val:  images/val  # 验证图片文件夹（可同train）
+
+
+# 类别名请按实际填写
+names:
+  0: car
+  1: truck
+  2: bus
