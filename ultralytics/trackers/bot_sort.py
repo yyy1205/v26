@@ -39,11 +39,28 @@ class ReidRecoveryConfig:
             project's genuine long-gap recoveries never exceeded ~6.2 px/frame of actual displacement
             (measured from confirmed IDSW cases), so 20 px/frame leaves ample headroom for real
             (including curved-road) motion while still rejecting cross-frame teleportation.
+        EDGE_MARGIN_PX (float): A Lost track whose last observation sits within this many pixels of the
+            frame boundary is a candidate for the "actually drove off-screen" exclusion below. A plain
+            "last position is near the edge" filter was tried and measured unsafe: on this footage 91%
+            of ALL long-gap recoveries (legit ones included) have an edge-adjacent last position, because
+            the chronic-occlusion ramp corner that motivates this whole recovery pass happens to sit right
+            at the frame boundary too — position alone can't tell "drove away for good" from "still on the
+            ramp, just undetected". See `EDGE_EXIT_MIN_SPEED` for the signal that actually discriminates.
+        EDGE_EXIT_MIN_SPEED (float): Only skip an edge-adjacent Lost track as a recovery candidate if its
+            Kalman velocity *at the moment it was lost* also had an outward component (toward the nearest
+            boundary) exceeding this speed (px/frame) — i.e. it was actually heading off-screen, not just
+            entering, idling, or drifting parallel to the edge. Measured on this footage: restricting to
+            direction-aware exclusion still catches 10/12 of the confirmed edge-zombie IDSW cases while
+            only affecting 77% of all-recoveries instead of 91%, and the ones it does affect mostly have a
+            visibly ballistic outward trajectory (multi-px/frame straight toward the boundary), not the
+            near-zero/parallel drift of a track idling near an entry point.
     """
 
     MIN_GAP_FOR_RECOVERY = 30
     ACCEPT_SIM_THRESH = 0.65
     MAX_SPEED_PX_PER_FRAME = 20.0
+    EDGE_MARGIN_PX = 100.0
+    EDGE_EXIT_MIN_SPEED = 0.5
 
 
 class BOTrack(STrack):
@@ -256,6 +273,7 @@ class BOTSORT(BYTETracker):
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
         self.encoder = build_encoder(args.with_reid, args.model, getattr(args, "device", None))
+        self.frame_shape: tuple[int, int] | None = None  # (h, w) of the most recent frame, for edge-exit checks
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
         """Return an instance of KalmanFilterXYWH for predicting and updating object states."""
@@ -263,6 +281,8 @@ class BOTSORT(BYTETracker):
 
     def _pre_first_associate(self, strack_pool, unconfirmed, img, results_high) -> None:
         """Apply GMC using BOTrack's dimension-aware multi_gmc (not the generic width/height-corrupting one)."""
+        if img is not None:
+            self.frame_shape = img.shape[:2]
         if hasattr(self, "gmc") and img is not None:
             try:
                 warp = self.gmc.apply(img, results_high.xyxy)
@@ -329,6 +349,35 @@ class BOTSORT(BYTETracker):
             track.mean, track.covariance = track.kalman_filter.update(track.mean, track.covariance, obs)
         track.predict()  # advance to t2; re_activate()'s update() assumes an already-predicted mean
 
+    def _is_exiting_frame(self, track: BOTrack) -> bool:
+        """Check whether `track` was last seen heading off-screen, not just idling/entering near an edge.
+
+        A Lost track near the frame boundary is ambiguous by position alone (see `ReidRecoveryConfig.
+        EDGE_MARGIN_PX`). What actually distinguishes "drove away for good" is the direction of travel at
+        the moment it was lost: a track whose Kalman velocity pointed outward, toward the nearest
+        boundary, faster than `EDGE_EXIT_MIN_SPEED`, was genuinely leaving the scene. A track that was
+        entering, idling, or moving roughly parallel to the boundary is not.
+        """
+        if track.last_observed_mean is None or self.frame_shape is None:
+            return False
+        cfg = ReidRecoveryConfig
+        x, y = track.last_observed_mean[0], track.last_observed_mean[1]
+        h, w = self.frame_shape
+        d_left, d_right, d_top, d_bottom = x, w - x, y, h - y
+        d_min = min(d_left, d_right, d_top, d_bottom)
+        if d_min >= cfg.EDGE_MARGIN_PX:
+            return False
+        if d_min == d_left:
+            outward = (-1.0, 0.0)
+        elif d_min == d_right:
+            outward = (1.0, 0.0)
+        elif d_min == d_top:
+            outward = (0.0, -1.0)
+        else:
+            outward = (0.0, 1.0)
+        vx, vy = track.last_observed_mean[4], track.last_observed_mean[5]
+        return (vx * outward[0] + vy * outward[1]) > cfg.EDGE_EXIT_MIN_SPEED
+
     def _post_first_association(
         self,
         strack_pool: list[BOTrack],
@@ -350,10 +399,11 @@ class BOTSORT(BYTETracker):
         Appearance doesn't have that problem — two different nearby vehicles usually still look
         different. So this pass only fires for tracks lost long enough that IoU-based recovery is
         already known to fail (`MIN_GAP_FOR_RECOVERY`), and only accepts a candidate whose ReID
-        cosine similarity to the track's EMA-smoothed appearance feature clears `ACCEPT_SIM_THRESH` —
-        no distance/motion reasoning involved at all. If no candidate clears the bar for a given
-        detection, it is left untouched and falls through to the normal downstream stages
-        (unconfirmed association, then new-track creation) exactly as today.
+        cosine similarity to the track's EMA-smoothed appearance feature clears `ACCEPT_SIM_THRESH`,
+        subject to a physical-distance sanity bound (`MAX_SPEED_PX_PER_FRAME`) and an edge-exit check
+        (`_is_exiting_frame`) that drops candidates last seen heading off-screen. If no candidate clears
+        the bar for a given detection, it is left untouched and falls through to the normal downstream
+        stages (unconfirmed association, then new-track creation) exactly as today.
         """
         if not self.args.with_reid or self.encoder is None:
             return u_track, u_detection
@@ -365,6 +415,7 @@ class BOTSORT(BYTETracker):
             and strack_pool[i].last_observed_frame is not None
             and (self.frame_id - strack_pool[i].last_observed_frame) >= cfg.MIN_GAP_FOR_RECOVERY
             and strack_pool[i].smooth_feat is not None
+            and not self._is_exiting_frame(strack_pool[i])
         ]
         det_idx = [j for j in u_detection if detections[j].curr_feat is not None]
         if len(lost_idx) == 0 or len(det_idx) == 0:

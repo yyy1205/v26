@@ -138,4 +138,47 @@ assert len(refind) == 0 and new_u_track == [0] and new_u_detection == [0], \
     "外观相似但物理距离远超合理范围，不应该被恢复——这正是实测抓到的真实bug"
 print("  通过（即使外观向量完全一样，物理距离不合理也会被拒绝）\n")
 
+print("=== 6. 靠近画面边缘且速度朝外(真的在驶出画面) -> 不应恢复 ===")
+bot = fresh_bot()
+bot.frame_shape = (1988, 3534)  # (h, w)，模拟真实视频分辨率
+track = make_det(50, 1000, feat=feat_a)  # 靠近左边缘(margin=100)
+track.activate(bot.kalman_filter, frame_id=1)
+track.mark_lost()
+track.last_observed_mean[4] = -5.0  # vx 朝左(朝最近的左边界方向)，明显超过EDGE_EXIT_MIN_SPEED
+track.last_observed_mean[5] = 0.0
+bot.frame_id = 1 + ReidRecoveryConfig.MIN_GAP_FOR_RECOVERY + 10
+
+det_same_car = make_det(60, 1005, idx=0, feat=feat_a)  # 外观一样，位置也很近，仅方向不同
+strack_pool = [track]
+detections = [det_same_car]
+u_track, u_detection = [0], [0]
+activated, refind = [], []
+new_u_track, new_u_detection = bot._post_first_association(strack_pool, detections, u_track, u_detection, activated, refind)
+print(f"  靠边缘+朝外驶出时: refind={len(refind)}, 剩余u_track={new_u_track}, 剩余u_detection={new_u_detection}")
+assert len(refind) == 0 and new_u_track == [0] and new_u_detection == [0], \
+    "track丢失前正朝画面边缘驶出，大概率已经开走了，不应该被当成僵尸恢复候选"
+print("  通过（即使外观和距离都合理，朝画面外驶出的track也会被排除）\n")
+
+
+print("=== 7. 靠近画面边缘但速度朝内/平行(刚驶入或原地丢失) -> 仍应正常恢复 ===")
+bot = fresh_bot()
+bot.frame_shape = (1988, 3534)
+track = make_det(50, 1000, feat=feat_a)  # 同样靠近左边缘
+track.activate(bot.kalman_filter, frame_id=1)
+track.mark_lost()
+track.last_observed_mean[4] = 5.0  # vx 朝右(朝画面内部)，说明是刚驶入或在往内走
+track.last_observed_mean[5] = 0.0
+bot.frame_id = 1 + ReidRecoveryConfig.MIN_GAP_FOR_RECOVERY + 10
+
+det_same_car = make_det(60, 1005, idx=0, feat=feat_a)
+strack_pool = [track]
+detections = [det_same_car]
+u_track, u_detection = [0], [0]
+activated, refind = [], []
+new_u_track, new_u_detection = bot._post_first_association(strack_pool, detections, u_track, u_detection, activated, refind)
+print(f"  靠边缘+朝内运动时: refind track_id={[t.track_id for t in refind]}, 剩余u_track={new_u_track}, 剩余u_detection={new_u_detection}")
+assert len(refind) == 1 and new_u_track == [] and new_u_detection == [], \
+    "track虽然靠边缘丢失，但丢失前是朝画面内部运动的(不是在驶出)，应该正常按外观恢复"
+print("  通过（同样靠边缘，但方向朝内时不受影响，正常恢复）\n")
+
 print("全部测试通过。")

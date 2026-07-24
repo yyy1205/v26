@@ -115,7 +115,7 @@ MODEL_PATH = r"D:\yolo26-tracking\runs\obb\exp_yolo26-3\weights\best.pt"   # YOL
 # ROI 持久化文件路径（与视频同目录，同文件名 + _roi.json）
 ROI_FILE = os.path.splitext(VIDEO_PATH)[0] + "_roi.json"
 # OSNet AIN ReID 模型路径
-REID_MODEL_PATH = r"D:\deep-person-reid-master\scripts\log\osnet_ain_x1_0_market1501_softmax_cosinelr\model\model.pth.tar-100"  # 置空以关闭 ReID
+REID_MODEL_PATH = r"D:\deep-person-reid-master\scripts\log\osnet_ain_x1_0_market1501_softmax_cosinelr\model\model.pth.tar-100"
 
 timestamp = time.strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = f"outputs/yolo26-obb_{timestamp}"

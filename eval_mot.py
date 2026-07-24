@@ -18,7 +18,7 @@ from scipy.optimize import linear_sum_assignment
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 GT_XML   = r"E:\DJI\cvat\GT(1).xml"
-PRED_TXT = r"D:\yolo26-tracking\outputs\yolo26-obb_20260723_213702\cvat_eval.txt"
+PRED_TXT = r"D:\yolo26-tracking\outputs\yolo26-obb_20260724_120344\cvat_eval.txt"
 IOU_THRESH = 0.5          # TP 判定阈值
 CENTER_DIST_FILTER = 300  # 像素，超过此距离直接跳过 IoU 计算（加速）
 # ─────────────────────────────────────────────────────────────────────────────
