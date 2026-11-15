@@ -110,12 +110,12 @@ def apply_blurred_background_fill(frame, roi_mask, feather=51, blur_ksize=101):
     return out
 
 # --------- 配置（按需修改） ---------
-VIDEO_PATH = r"E:\DJI\cvat\0111_D_stabilized.avi"
+VIDEO_PATH = os.environ.get("TRACK_VIDEO_PATH", r"E:\DJI\9\DJI_20240310135754_0193_D.MP4")
 MODEL_PATH = r"D:\yolo26-tracking\runs\obb\exp_yolo26-3\weights\best.pt"   # YOLO26 OBB 自训练权重(data17数据集)
 # ROI 持久化文件路径（与视频同目录，同文件名 + _roi.json）
 ROI_FILE = os.path.splitext(VIDEO_PATH)[0] + "_roi.json"
 # OSNet AIN ReID 模型路径
-REID_MODEL_PATH = r"D:\deep-person-reid-master\scripts\log\osnet_ain_x1_0_market1501_softmax_cosinelr\model\model.pth.tar-100"
+REID_MODEL_PATH = ""  # 置空以关闭 ReID（回退到"无增强+纯KF基线"——目前实测最优配置：IDSW=1, MOTA≈99.2%，且不存在ReID导致的变色龙id复用问题）
 
 timestamp = time.strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = f"outputs/yolo26-obb_{timestamp}"
@@ -184,27 +184,16 @@ GLOBAL_NMS_IOS_THR = 0.5   # 全局(跨类别)NMS的IOS阈值：航拍俯视下�
 
 OPPOSITE_EDGE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
-# ── 切片坐标生成（等价于 sahi.slicing.get_slice_bboxes）────────────────────────
+# ── 切片坐标生成：直接用 SAHI 官方实现（原先是手写的等价版本，现在改为真依赖）──
+from sahi.slicing import get_slice_bboxes as _sahi_get_slice_bboxes
+
 def get_slice_bboxes(H, W, sh=640, sw=640, oh=0.3, ow=0.3):
-    y_overlap = int(oh * sh)
-    x_overlap = int(ow * sw)
-    bboxes = []
-    y_min = 0
-    while y_min < H:
-        y_max = min(H, y_min + sh)
-        y1 = max(0, y_max - sh)
-        x_min = 0
-        while x_min < W:
-            x_max = min(W, x_min + sw)
-            x1 = max(0, x_max - sw)
-            bboxes.append((x1, y1, x_max, y_max))
-            if x_max == W:
-                break
-            x_min = x_max - x_overlap
-        if y_max == H:
-            break
-        y_min = y_max - y_overlap
-    return bboxes
+    return _sahi_get_slice_bboxes(
+        image_height=H, image_width=W,
+        slice_height=sh, slice_width=sw,
+        auto_slice_resolution=False,  # sh/sw 都已显式传入，不需要自动推断
+        overlap_height_ratio=oh, overlap_width_ratio=ow,
+    )
 
 # ── 截断检测：区分"贴原图真实边界"还是"贴切片内部人为切线" ──────────────
 def _touched_edges(xywhr, slice_box, margin=EDGE_MARGIN):
@@ -386,6 +375,7 @@ def _obb_nmm(dets, ios_thr=0.5, truncation_aware=False, class_agnostic=False):
             continue
         cur_cls     = dets[i]['cls']
         anchor_poly = polys[i]
+        group       = [i]   # 同一物体的重复候选组，用于之后挑"最完整"的框
 
         for j in range(i + 1, len(dets)):
             if merged[j] or (not class_agnostic and dets[j]['cls'] != cur_cls):
@@ -393,12 +383,16 @@ def _obb_nmm(dets, ios_thr=0.5, truncation_aware=False, class_agnostic=False):
             inter    = anchor_poly.intersection(polys[j]).area
             min_area = min(anchor_poly.area, polys[j].area)
             if min_area > 0 and inter / min_area > ios_thr:
-                merged[j] = True   # 抑制重叠框，直接保留 anchor，不做平均
+                merged[j] = True   # 抑制重叠框，标记为组内成员
+                group.append(j)
 
-        # 保留 anchor（最高置信框）原始 xywhr，角度来自 YOLO 原生输出不做任何修改
+        # 组内保留面积最大（最完整）的框，而不是置信度最高的：
+        # 车身被干扰（车道标线/箭头等）导致的碎片检测，置信度有时反而高于完整检测，
+        # 单纯按置信度选锚点会让残缺框顶掉完整框（video2 GT283 id594 案例已实测验证）。
+        best = max(group, key=lambda k: polys[k].area)
         result.append({
-            'xywhr': dets[i]['xywhr'].copy(),
-            'conf':  float(dets[i]['conf']),
+            'xywhr': dets[best]['xywhr'].copy(),
+            'conf':  float(dets[best]['conf']),
             'cls':   cur_cls,
         })
     return result
@@ -822,6 +816,12 @@ if not ret:
 _roi_loaded = False
 _need_calibration = True
 _need_drawing = True
+if os.environ.get("TRACK_FULL_FRAME", "0") == "1":
+    roi_polys_modes = []
+    pixel_length = 1.0
+    real_length = 1.0
+    _need_calibration = False
+    _need_drawing = False
 if os.path.exists(ROI_FILE):
     print(f"\n检测到已保存的 ROI 文件: {ROI_FILE}")
     redraw = input("是否重新绘制 ROI？(y=重新绘制 / 直接回车=使用已有): ").strip().lower()
@@ -983,8 +983,8 @@ while cap.isOpened():
     if not success:
         break
 
-    frame = apply_clahe(frame)
-    frame = gamma_transform(frame, gamma=1.2)
+    # frame = apply_clahe(frame)
+    # frame = gamma_transform(frame, gamma=1.2)
 
     # If PRE_MASK_DETECTION enabled and roi_mask exists, create masked frame for detection
     proc_frame_for_sahi = frame
@@ -1103,10 +1103,11 @@ while cap.isOpened():
                           (0, 255, 255) if mode == 1 else (0, 0, 255), 2)
 
     display_frame = cv2.resize(display_frame, (int(display_frame.shape[1]*display_scale), int(display_frame.shape[0]*display_scale)))
-    cv2.imshow("Tracking (ROI applied)", display_frame)
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:
-        break
+    if os.environ.get("TRACK_HEADLESS", "0") != "1":
+        cv2.imshow("Tracking (ROI applied)", display_frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            break
 
     out.write(frame)
     processed_frames += 1

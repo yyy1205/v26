@@ -184,27 +184,16 @@ GLOBAL_NMS_IOS_THR = 0.5   # 全局(跨类别)NMS的IOS阈值：航拍俯视下�
 
 OPPOSITE_EDGE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
-# ── 切片坐标生成（等价于 sahi.slicing.get_slice_bboxes）────────────────────────
+# ── 切片坐标生成：直接用 SAHI 官方实现（原先是手写的等价版本，现在改为真依赖）──
+from sahi.slicing import get_slice_bboxes as _sahi_get_slice_bboxes
+
 def get_slice_bboxes(H, W, sh=640, sw=640, oh=0.3, ow=0.3):
-    y_overlap = int(oh * sh)
-    x_overlap = int(ow * sw)
-    bboxes = []
-    y_min = 0
-    while y_min < H:
-        y_max = min(H, y_min + sh)
-        y1 = max(0, y_max - sh)
-        x_min = 0
-        while x_min < W:
-            x_max = min(W, x_min + sw)
-            x1 = max(0, x_max - sw)
-            bboxes.append((x1, y1, x_max, y_max))
-            if x_max == W:
-                break
-            x_min = x_max - x_overlap
-        if y_max == H:
-            break
-        y_min = y_max - y_overlap
-    return bboxes
+    return _sahi_get_slice_bboxes(
+        image_height=H, image_width=W,
+        slice_height=sh, slice_width=sw,
+        auto_slice_resolution=False,  # sh/sw 都已显式传入，不需要自动推断
+        overlap_height_ratio=oh, overlap_width_ratio=ow,
+    )
 
 # ── 截断检测：区分"贴原图真实边界"还是"贴切片内部人为切线" ──────────────
 def _touched_edges(xywhr, slice_box, margin=EDGE_MARGIN):
@@ -386,6 +375,7 @@ def _obb_nmm(dets, ios_thr=0.5, truncation_aware=False, class_agnostic=False):
             continue
         cur_cls     = dets[i]['cls']
         anchor_poly = polys[i]
+        group       = [i]   # 同一物体的重复候选组，用于之后挑"最完整"的框
 
         for j in range(i + 1, len(dets)):
             if merged[j] or (not class_agnostic and dets[j]['cls'] != cur_cls):
@@ -393,12 +383,16 @@ def _obb_nmm(dets, ios_thr=0.5, truncation_aware=False, class_agnostic=False):
             inter    = anchor_poly.intersection(polys[j]).area
             min_area = min(anchor_poly.area, polys[j].area)
             if min_area > 0 and inter / min_area > ios_thr:
-                merged[j] = True   # 抑制重叠框，直接保留 anchor，不做平均
+                merged[j] = True   # 抑制重叠框，标记为组内成员
+                group.append(j)
 
-        # 保留 anchor（最高置信框）原始 xywhr，角度来自 YOLO 原生输出不做任何修改
+        # 组内保留面积最大（最完整）的框，而不是置信度最高的：
+        # 车身被干扰（车道标线/箭头等）导致的碎片检测，置信度有时反而高于完整检测，
+        # 单纯按置信度选锚点会让残缺框顶掉完整框（video2 GT283 id594 案例已实测验证）。
+        best = max(group, key=lambda k: polys[k].area)
         result.append({
-            'xywhr': dets[i]['xywhr'].copy(),
-            'conf':  float(dets[i]['conf']),
+            'xywhr': dets[best]['xywhr'].copy(),
+            'conf':  float(dets[best]['conf']),
             'cls':   cur_cls,
         })
     return result

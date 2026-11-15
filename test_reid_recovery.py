@@ -181,4 +181,42 @@ assert len(refind) == 1 and new_u_track == [] and new_u_detection == [], \
     "track虽然靠边缘丢失，但丢失前是朝画面内部运动的(不是在驶出)，应该正常按外观恢复"
 print("  通过（同样靠边缘，但方向朝内时不受影响，正常恢复）\n")
 
+print("=== 8. 外观/距离都合理，但尺寸差异很大(不同大小的车) -> 不应恢复 ===")
+bot = fresh_bot()
+track = make_det(400, 400, w=80, h=40, feat=feat_a)  # 正常轿车尺寸
+track.activate(bot.kalman_filter, frame_id=1)
+track.mark_lost()
+bot.frame_id = 1 + ReidRecoveryConfig.MIN_GAP_FOR_RECOVERY + 10
+
+det_big_car = make_det(405, 405, w=160, h=80, idx=0, feat=feat_a)  # 尺寸整整大一倍，外观向量故意设成一样
+strack_pool = [track]
+detections = [det_big_car]
+u_track, u_detection = [0], [0]
+activated, refind = [], []
+new_u_track, new_u_detection = bot._post_first_association(strack_pool, detections, u_track, u_detection, activated, refind)
+print(f"  尺寸差异大时: refind={len(refind)}, 剩余u_track={new_u_track}, 剩余u_detection={new_u_detection}")
+assert len(refind) == 0 and new_u_track == [0] and new_u_detection == [0], \
+    "外观和距离都合理，但车辆物理尺寸差异很大，大概率不是同一辆车，不应该被恢复"
+print("  通过（即使外观向量完全一样，尺寸对不上也会被拒绝）\n")
+
+
+print("=== 9. 外观/距离合理，尺寸也基本一致(仅有正常检测噪声) -> 仍应正常恢复 ===")
+bot = fresh_bot()
+track = make_det(400, 400, w=80, h=40, feat=feat_a)
+track.activate(bot.kalman_filter, frame_id=1)
+old_id = track.track_id
+track.mark_lost()
+bot.frame_id = 1 + ReidRecoveryConfig.MIN_GAP_FOR_RECOVERY + 10
+
+det_same_size_car = make_det(405, 405, w=90, h=45, idx=0, feat=feat_a)  # 尺寸略有出入，正常检测噪声范围
+strack_pool = [track]
+detections = [det_same_size_car]
+u_track, u_detection = [0], [0]
+activated, refind = [], []
+new_u_track, new_u_detection = bot._post_first_association(strack_pool, detections, u_track, u_detection, activated, refind)
+print(f"  尺寸基本一致时: refind track_id={[t.track_id for t in refind]}, 剩余u_track={new_u_track}, 剩余u_detection={new_u_detection}")
+assert len(refind) == 1 and refind[0].track_id == old_id and new_u_track == [] and new_u_detection == [], \
+    "尺寸只是正常检测噪声范围内的出入，不应该被尺寸门槛误伤"
+print("  通过（正常的尺寸检测噪声不受影响，仍正常恢复）\n")
+
 print("全部测试通过。")

@@ -17,11 +17,44 @@ from collections import defaultdict
 from scipy.optimize import linear_sum_assignment
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
-GT_XML   = r"E:\DJI\cvat\GT(1).xml"
-PRED_TXT = r"D:\yolo26-tracking\outputs\yolo26-obb_20260724_120344\cvat_eval.txt"
+GT_XML   = r"D:\ultralytics-8.1.41\outputs\v8e53-2condence_20260521_150313\mota.xml"
+PRED_TXT = r"D:\yolo26-tracking\outputs\yolo26-obb_20260805_192534\cvat_eval.txt"
 IOU_THRESH = 0.5          # TP 判定阈值
 CENTER_DIST_FILTER = 300  # 像素，超过此距离直接跳过 IoU 计算（加速）
+FRAME_W, FRAME_H = 3534, 1988   # 视频分辨率，用于判断车辆是否完全进入画面
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _fully_inside_frame(cx, cy, w, h, rot_deg) -> bool:
+    """给定的框(4个角点)是否完全落在画面内。"""
+    box = cv2.boxPoints(((float(cx), float(cy)), (float(w), float(h)), float(rot_deg)))
+    return bool(np.all(box[:, 0] >= 0) and np.all(box[:, 0] <= FRAME_W)
+                and np.all(box[:, 1] >= 0) and np.all(box[:, 1] <= FRAME_H))
+
+
+def _edge_margin(cx, cy) -> float:
+    """框中心离画面4条边里最近的一条边的距离，越大说明这个位置越"居中"、越不容易被边缘裁切。"""
+    return min(cx, FRAME_W - cx, cy, FRAME_H - cy)
+
+
+def _compute_stable_sizes(tracks_by_id: dict) -> dict:
+    """车辆没有完全进入画面时，标注/检测框的尺寸本身是不准的(被边缘裁小)，不能直接拿当前帧
+    自己的框去判断"是否完全入画"——那是循环论证。改为：每条轨迹先找出框中心离画面边界最远
+    (最不可能被裁切)的那一帧，把那一帧的(w,h)当作这条轨迹的"真实稳定尺寸"；判断任意一帧是否
+    完全入画时，用这个稳定尺寸配合该帧自己的位置和角度重建一个框，而不是用该帧自己可能已经被
+    裁小的框。
+
+    Args:
+        tracks_by_id: {id: [(cx, cy, w, h, rot), ...]}
+
+    Returns:
+        {id: (stable_w, stable_h)}
+    """
+    stable = {}
+    for tid, rows in tracks_by_id.items():
+        best = max(rows, key=lambda r: _edge_margin(r[0], r[1]))
+        stable[tid] = (best[2], best[3])
+    return stable
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -115,6 +148,20 @@ def evaluate():
     print(f"GT 帧数={len(gt_frames)}  GT 总框={sum(len(v) for v in gt.values())}")
     print(f"Pred 帧数={len(pred)}  Pred 总框={sum(len(v) for v in pred.values())}\n")
 
+    # 各轨迹的"稳定尺寸"(用离画面边界最远的那一帧的框大小)，见 _compute_stable_sizes 说明
+    gt_tracks_by_id: dict[int, list] = defaultdict(list)
+    for boxes in gt.values():
+        for gid, cx, cy, w, h, rot in boxes:
+            gt_tracks_by_id[gid].append((cx, cy, w, h, rot))
+    gt_stable_size = _compute_stable_sizes(gt_tracks_by_id)
+
+    pred_tracks_by_id: dict[int, list] = defaultdict(list)
+    for boxes in pred.values():
+        for tid, pts in boxes:
+            (pcx, pcy), (pw, ph), prot = cv2.minAreaRect(pts)
+            pred_tracks_by_id[tid].append((pcx, pcy, pw, ph, prot))
+    pred_stable_size = _compute_stable_sizes(pred_tracks_by_id)
+
     total_gt   = 0
     total_tp   = 0
     total_fp   = 0
@@ -139,7 +186,17 @@ def evaluate():
         pred_frame = gt_frame + 1           # 帧号偏移
 
         gt_list   = gt[gt_frame]            # [(gt_id, cx, cy, w, h, rot)]
+        gt_list   = [
+            b for b in gt_list
+            if _fully_inside_frame(b[1], b[2], *gt_stable_size[b[0]], b[5])
+        ]
         pred_list = pred.get(pred_frame, []) # [(track_id, pts)]
+        _filtered_pred_list = []
+        for tid, pts in pred_list:
+            (pcx, pcy), (_pw, _ph), prot = cv2.minAreaRect(pts)
+            if _fully_inside_frame(pcx, pcy, *pred_stable_size[tid], prot):
+                _filtered_pred_list.append((tid, pts))
+        pred_list = _filtered_pred_list
 
         total_gt += len(gt_list)
         for tid, _ in pred_list:
@@ -251,7 +308,13 @@ def evaluate():
                          if gt_idtp[gid] / max(gt_idtp[gid] + gt_idfn[gid], 1) >= 0.8)
     mostly_lost    = sum(1 for gid in gt_idfn
                          if gt_idfn[gid] / max(gt_idtp.get(gid,0) + gt_idfn[gid], 1) >= 0.8)
-    n_gt_tracks    = len(set(gid for boxes in gt.values() for gid, *_ in boxes))
+    # 跟 unique_pred_ids 口径保持一致：只统计"至少有一帧完全入画"的GT轨迹，
+    # 不能直接用未过滤的原始gt字典，否则GT这边偏宽松、pred那边偏严格，两个数字没法直接比较。
+    n_gt_tracks = 0
+    for gid, rows in gt_tracks_by_id.items():
+        sw, sh = gt_stable_size[gid]
+        if any(_fully_inside_frame(cx, cy, sw, sh, rot) for cx, cy, _w, _h, rot in rows):
+            n_gt_tracks += 1
 
     elapsed = time.time() - t0
 
@@ -291,6 +354,8 @@ def evaluate():
     print(f"  {'GT帧号':>8}  {'GT id':>8}  {'旧 pred_id':>10}  {'新 pred_id':>10}")
     for gt_frame, gt_id, old_pid, new_pid in idsw_events:
         print(f"  {gt_frame:>8}  {gt_id:>8}  {old_pid:>10}  {new_pid:>10}")
+
+    return idsw_events
 
 
 if __name__ == "__main__":

@@ -74,6 +74,7 @@ from ultralytics.nn.modules import (
     YOLOESegment26,
     v10Detect,
 )
+from ultralytics.nn.extra.MoblieNetV4 import MobileNetV4Backbone
 from ultralytics.utils import (
     DEFAULT_CFG_DICT,
     LOGGER,
@@ -2022,6 +2023,11 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is MobileNetV4Backbone:
+            # The backbone returns a feature list; YAML supplies its channel list
+            # so following Index layers can expose P3/P4/P5 to the YOLO head.
+            c2 = args[1]
+            args = [args[0]]
         else:
             c2 = ch[f]
 

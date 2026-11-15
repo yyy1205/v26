@@ -46,6 +46,17 @@ class ReidRecoveryConfig:
             the chronic-occlusion ramp corner that motivates this whole recovery pass happens to sit right
             at the frame boundary too — position alone can't tell "drove away for good" from "still on the
             ramp, just undetected". See `EDGE_EXIT_MIN_SPEED` for the signal that actually discriminates.
+        MIN_SIZE_IOU (float): Rotation-independent size-consistency gate — compares only (long side, short
+            side) of the candidate's last-observed box against the new detection's box (both reduced to
+            their own long/short edges first, so a 90-degree labeling ambiguity doesn't matter), ignoring
+            position and orientation entirely. Orientation is deliberately excluded: a vehicle recovered
+            after a long gap on a curved ramp has genuinely rotated with the road, so requiring angle
+            agreement would penalize exactly the curved-road recoveries this pass exists for. Physical
+            size doesn't change with heading, so it stays valid there. Measured on this project's real
+            "chimera" mismatches (a Lost track's old id wrongly reactivated by a different real vehicle):
+            some pairs (similarly-sized sedans) aren't caught by this alone, but clear size mismatches
+            (e.g. 0.44 for a confirmed bad case) are — set below the ~0.61-0.95 range measured on confirmed
+            genuine recoveries, so it only rejects clearly-mismatched sizes, not ordinary detection noise.
         EDGE_EXIT_MIN_SPEED (float): Only skip an edge-adjacent Lost track as a recovery candidate if its
             Kalman velocity *at the moment it was lost* also had an outward component (toward the nearest
             boundary) exceeding this speed (px/frame) — i.e. it was actually heading off-screen, not just
@@ -61,6 +72,7 @@ class ReidRecoveryConfig:
     MAX_SPEED_PX_PER_FRAME = 20.0
     EDGE_MARGIN_PX = 100.0
     EDGE_EXIT_MIN_SPEED = 0.5
+    MIN_SIZE_IOU = 0.5
 
 
 class BOTrack(STrack):
@@ -378,6 +390,21 @@ class BOTSORT(BYTETracker):
         vx, vy = track.last_observed_mean[4], track.last_observed_mean[5]
         return (vx * outward[0] + vy * outward[1]) > cfg.EDGE_EXIT_MIN_SPEED
 
+    @staticmethod
+    def _size_iou(w1: float, h1: float, w2: float, h2: float) -> float:
+        """Rotation-independent size-consistency score: IoU of the two boxes' (long, short) edges only.
+
+        Reducing each box to (max(w,h), min(w,h)) before comparing sidesteps the label ambiguity between
+        w/h and a +/-90 degree angle, and deliberately discards orientation entirely — see
+        `ReidRecoveryConfig.MIN_SIZE_IOU` for why angle isn't safe to use here.
+        """
+        long1, short1 = max(w1, h1), min(w1, h1)
+        long2, short2 = max(w2, h2), min(w2, h2)
+        inter = min(long1, long2) * min(short1, short2)
+        area1, area2 = long1 * short1, long2 * short2
+        union = area1 + area2 - inter
+        return inter / union if union > 0 else 0.0
+
     def _post_first_association(
         self,
         strack_pool: list[BOTrack],
@@ -400,10 +427,12 @@ class BOTSORT(BYTETracker):
         different. So this pass only fires for tracks lost long enough that IoU-based recovery is
         already known to fail (`MIN_GAP_FOR_RECOVERY`), and only accepts a candidate whose ReID
         cosine similarity to the track's EMA-smoothed appearance feature clears `ACCEPT_SIM_THRESH`,
-        subject to a physical-distance sanity bound (`MAX_SPEED_PX_PER_FRAME`) and an edge-exit check
-        (`_is_exiting_frame`) that drops candidates last seen heading off-screen. If no candidate clears
-        the bar for a given detection, it is left untouched and falls through to the normal downstream
-        stages (unconfirmed association, then new-track creation) exactly as today.
+        subject to a physical-distance sanity bound (`MAX_SPEED_PX_PER_FRAME`), an edge-exit check
+        (`_is_exiting_frame`) that drops candidates last seen heading off-screen, and a rotation-independent
+        size-consistency check (`_size_iou` vs. `MIN_SIZE_IOU`) that drops candidates whose physical
+        dimensions don't match the new detection. If no candidate clears the bar for a given detection, it
+        is left untouched and falls through to the normal downstream stages (unconfirmed association, then
+        new-track creation) exactly as today.
         """
         if not self.args.with_reid or self.encoder is None:
             return u_track, u_detection
@@ -441,9 +470,20 @@ class BOTSORT(BYTETracker):
                 dx, dy = det.tlwh[0] + det.tlwh[2] / 2, det.tlwh[1] + det.tlwh[3] / 2
                 if float(np.hypot(dx - lx, dy - ly)) > max_dist:
                     continue  # appearance matched, but physically implausible given how long it's been lost
+                size_iou = self._size_iou(
+                    track.last_observed_mean[2], track.last_observed_mean[3],
+                    det.tlwh[2], det.tlwh[3],
+                )
+                if size_iou < cfg.MIN_SIZE_IOU:
+                    continue  # appearance and distance matched, but this is a differently-sized vehicle
                 candidates.append((-sim, ti, dj))
 
         candidates.sort(key=lambda c: c[0])
+
+        import os as _os
+        if _os.environ.get("REID_DEBUG_LOG"):
+            self._debug_log_candidates(candidates, strack_pool, detections)
+
         used_tracks, used_dets = set(), set()
         for _, ti, dj in candidates:
             if ti in used_tracks or dj in used_dets:
@@ -461,6 +501,27 @@ class BOTSORT(BYTETracker):
             [i for i in u_track if i not in used_tracks],
             [j for j in u_detection if j not in used_dets],
         )
+
+    def _debug_log_candidates(
+        self, candidates: list[tuple[float, int, int]], strack_pool: list[BOTrack], detections: list[BOTrack]
+    ) -> None:
+        """Temporary debug hook: dump every (lost_track, candidate_det) pair considered this frame to a log file.
+
+        Gated behind the ``REID_DEBUG_LOG`` env var so it has zero cost/effect when unset. Used to
+        offline-compare the actual greedy pick against a global-optimal (Hungarian) assignment over
+        the same candidate set, to check whether greedy sequential acceptance is itself a source of
+        wrong chimera matches (as opposed to the underlying signal being ambiguous either way).
+        """
+        import os as _os
+
+        path = _os.environ["REID_DEBUG_LOG"]
+        with open(path, "a", encoding="utf-8") as f:
+            for neg_sim, ti, dj in candidates:
+                track, det = strack_pool[ti], detections[dj]
+                dx, dy = det.tlwh[0] + det.tlwh[2] / 2, det.tlwh[1] + det.tlwh[3] / 2
+                f.write(
+                    f"{self.frame_id}\t{track.track_id}\t{dj}\t{-neg_sim:.4f}\t{dx:.1f}\t{dy:.1f}\n"
+                )
 
     def init_track(self, results, img: np.ndarray | None = None) -> list[BOTrack]:
         """Initialize object tracks using detection bounding boxes, scores, class labels, and optional ReID features."""

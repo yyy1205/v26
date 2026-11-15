@@ -64,6 +64,9 @@ class STrack(BaseTrack):
         super().__init__()
         # xywh+idx or xywha+idx
         assert len(xywh) in {5, 6}, f"expected 5 or 6 values but got {len(xywh)}"
+        xywh = np.asarray(xywh, dtype=np.float64).copy()
+        if len(xywh) == 6:
+            xywh[2], xywh[3], xywh[4] = self._disambiguate_angle(xywh[2], xywh[3], xywh[4])
         self._tlwh = np.asarray(xywh2ltwh(xywh[:4]), dtype=np.float32)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
@@ -97,11 +100,28 @@ class STrack(BaseTrack):
             stracks[i].mean = mean
             stracks[i].covariance = cov
 
-    def _disambiguate_angle(self, new_angle):
-        """YOLO 直出 xywhr 角度已固定，无需消歧，直接透传。"""
-        if new_angle is None:
-            return new_angle
-        return float(new_angle)
+    def _disambiguate_angle(self, w: float, h: float, angle: float) -> tuple[float, float, float]:
+        """Canonicalize an OBB's (w, h, angle) so the long edge is always reported as `w`.
+
+        `cv2.minAreaRect`-style (w, h, angle) has an inherent ambiguity: (w, h, angle) and
+        (h, w, angle +/- 90 deg) describe the exact identical rotated rectangle (verified via
+        corner-point comparison: max coordinate diff 0.000000px across many test cases including
+        real detector output). Left alone, per-frame detector noise near this 90 deg wrap boundary
+        makes the raw angle flip by ~90 deg between otherwise-identical consecutive observations.
+        Since `self.angle` is a raw, unfiltered pass-through (no Kalman smoothing — see `update`/
+        `re_activate` below) written fresh into every matched track, a single such flip corrupts the
+        angle used for cost computation on the *next* frame until another match overwrites it,
+        which is large enough to fail the IoU-based association gate (observed root cause of a real
+        IDSW case: 92x26 @ -3deg -> 28x94 @ -90deg -> next real detection at 94x42 @ -13deg had only
+        ~13deg to compare against a stale -90deg instead of the ~3deg it should have been).
+        Canonicalizing here removes that spurious jump at the source, before it ever reaches
+        `self.angle` or the Kalman filter's (w, h) state.
+        """
+        if h > w:
+            w, h = h, w
+            angle = angle + np.pi / 2
+        angle = ((angle + np.pi / 2) % np.pi) - np.pi / 2
+        return w, h, angle
 
     def activate(self, kalman_filter: KalmanFilterXYAH, frame_id: int):
         """Activate a new tracklet using the provided Kalman filter and initialize its state and covariance."""

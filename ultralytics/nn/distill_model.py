@@ -78,7 +78,13 @@ class DistillationModel(nn.Module):
         self.teacher_model = teacher_model.to(device)
         self._freeze_teacher()
         self.student_model = student_model
-        self.feats_idx = self.get_distill_layers(student_model)
+        # Teacher and student may have different layer numbering (for example,
+        # YOLO26s versus the MobileNetV4 OBB model). Pair their detection-head
+        # inputs by feature level instead of indexing the teacher with the
+        # student's layer numbers.
+        self.student_feats_idx = self.get_distill_layers(student_model)
+        self.teacher_feats_idx = self.get_distill_layers(teacher_model)
+        self.feats_idx = self.student_feats_idx  # backwards-compatible alias
 
         # Hook-based feature capture: identical for teacher and student
         self._teacher_feats: dict[int, torch.Tensor] = {}
@@ -88,18 +94,18 @@ class DistillationModel(nn.Module):
         self._register_feature_hooks()
 
         # Get feature dimensions via dummy forward pass (hooks capture outputs)
-        imgsz = student_model.args.imgsz
+        imgsz = getattr(student_model.args, "imgsz", student_model.args.get("imgsz", 640))
         student_model.eval()
         with torch.no_grad():
             im = torch.zeros(2, ch, imgsz, imgsz, device=device)
             teacher_model(im)
             student_model(im)
         student_model.train()
-        teacher_output = [self._teacher_feats[idx] for idx in self.feats_idx]
-        student_output = [self._student_feats[idx] for idx in self.feats_idx]
+        teacher_output = [self._teacher_feats[idx] for idx in self.teacher_feats_idx]
+        student_output = [self._student_feats[idx] for idx in self.student_feats_idx]
 
         copy_attr(self, student_model)
-        self.dis = self.student_model.args.dis
+        self.dis = getattr(self.student_model.args, "dis", self.student_model.args.get("dis", 6.0))
         projectors = []
         for student_out, teacher_out in zip(student_output[:-1], teacher_output[:-1]):
             student_dim = self.decouple_outputs(student_out).shape[1]
@@ -154,12 +160,13 @@ class DistillationModel(nn.Module):
     def _register_feature_hooks(self) -> None:
         """Register feature-capture hooks, removing stale FeatureHook instances first."""
         self._remove_feature_hooks()
-        for idx in self.feats_idx:
+        for idx in self.student_feats_idx:
             self._clear_feature_hooks(self.student_model.model[idx])
             self._student_hooks.append(
                 self.student_model.model[idx].register_forward_hook(FeatureHook(self._student_feats, idx))
             )
-            if self.teacher_model is not None:
+        if self.teacher_model is not None:
+            for idx in self.teacher_feats_idx:
                 self._clear_feature_hooks(self.teacher_model.model[idx])
                 self._teacher_hooks.append(
                     self.teacher_model.model[idx].register_forward_hook(FeatureHook(self._teacher_feats, idx))
@@ -221,18 +228,18 @@ class DistillationModel(nn.Module):
         preds = self.student_model(batch["img"])  # hooks capture student features
 
         regular_loss, regular_loss_detach = self.student_model.loss(batch, preds)
-        teacher_head_feat = self._teacher_feats[self.feats_idx[-1]]
+        teacher_head_feat = self._teacher_feats[self.teacher_feats_idx[-1]]
         teacher_scores = (
             self.decouple_outputs(teacher_head_feat, branch="one2many")["scores"]
             + self.decouple_outputs(teacher_head_feat, branch="one2one")["scores"]
         ) / 2
         # neck feature sizes vary per batch (e.g. multi_scale), so split scores by the live teacher feats
-        neck_feats = [self._teacher_feats[idx] for idx in self.feats_idx[:-1]]
+        neck_feats = [self._teacher_feats[idx] for idx in self.teacher_feats_idx[:-1]]
         parts = torch.split(teacher_scores, [f.shape[-2] * f.shape[-1] for f in neck_feats], dim=-1)
         teacher_scores = tuple(p.sigmoid().max(dim=1, keepdim=True).values for p in parts)
-        for i, feat_idx in enumerate(self.feats_idx[:-1]):
-            teacher_feat = self.decouple_outputs(self._teacher_feats[feat_idx])
-            student_feat = self.projector[i](self.decouple_outputs(self._student_feats[feat_idx]))
+        for i, (student_idx, teacher_idx) in enumerate(zip(self.student_feats_idx[:-1], self.teacher_feats_idx[:-1])):
+            teacher_feat = self.decouple_outputs(self._teacher_feats[teacher_idx])
+            student_feat = self.projector[i](self.decouple_outputs(self._student_feats[student_idx]))
             loss_distill += (
                 self.loss_sl2(student_feat, teacher_feat, feat_idx=i, teacher_scores=teacher_scores) * self.dis
             )
